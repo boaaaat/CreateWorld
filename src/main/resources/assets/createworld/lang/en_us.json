@@ -1,0 +1,17 @@
+{
+  "block.createworld.creative_portal": "Creative Portal",
+  "block.createworld.creative_portal_frame": "Creative Portal Frame",
+  "item.createworld.creative_portal_activator": "Creative Portal Activator",
+  "itemGroup.createworld": "CreateWorld",
+  "message.createworld.already_in_session": "You are already in a CreateWorld session.",
+  "message.createworld.entered": "Creative testing session started.",
+  "message.createworld.forced_session": "CreateWorld isolated your inventory for this creative dimension.",
+  "message.createworld.invalid_portal": "Build a 4x5 frame with a 2x3 empty inside.",
+  "message.createworld.missing_dimension": "The creative testing dimension is not loaded.",
+  "message.createworld.missing_return_dimension": "Your return dimension is not loaded.",
+  "message.createworld.no_session": "You do not have an active CreateWorld session.",
+  "message.createworld.portal_warmup": "Portal opens in %s...",
+  "message.createworld.portal_warmup_start": "Stand in the portal.",
+  "message.createworld.returned": "Survival inventory restored.",
+  "message.createworld.teleport_failed": "Teleport failed; your saved inventory was left protected."
+}
