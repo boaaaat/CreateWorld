@@ -47,7 +47,7 @@ public final class CreateWorld {
                     .noOcclusion()
                     .noLootTable()
                     .strength(-1.0F, 3600000.0F)
-                    .lightLevel(state -> 11)
+                    .lightLevel(state -> 14)
                     .sound(SoundType.GLASS)));
 
     public static final DeferredItem<BlockItem> CREATIVE_PORTAL_FRAME_ITEM = ITEMS.registerSimpleBlockItem(

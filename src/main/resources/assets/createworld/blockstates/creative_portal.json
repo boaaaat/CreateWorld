@@ -1,10 +1,10 @@
 {
   "variants": {
     "axis=x": {
-      "model": "minecraft:block/nether_portal_ew"
+      "model": "createworld:block/creative_portal"
     },
     "axis=z": {
-      "model": "minecraft:block/nether_portal_ns"
+      "model": "createworld:block/creative_portal"
     }
   }
 }

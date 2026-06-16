@@ -1,6 +1,7 @@
 package com.abhil.createworld;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -10,17 +11,30 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.scores.Objective;
+import net.minecraft.world.scores.ReadOnlyScoreInfo;
+import net.minecraft.world.scores.ScoreAccess;
+import net.minecraft.world.scores.ScoreHolder;
+import net.minecraft.world.scores.Scoreboard;
+import net.neoforged.neoforge.attachment.AttachmentHolder;
+import net.neoforged.neoforge.attachment.AttachmentSync;
 import net.neoforged.neoforge.capabilities.Capabilities;
 import net.neoforged.neoforge.items.IItemHandler;
 import net.neoforged.neoforge.items.IItemHandlerModifiable;
+import net.neoforged.neoforge.items.wrapper.PlayerInvWrapper;
 
+import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -32,7 +46,12 @@ public final class CreativeWorldTeleporter {
     private static final String SESSION_TAG = CreateWorld.MODID + "_creative_session";
     private static final String SNAPSHOT_TAG = "Snapshot";
     private static final String CAPABILITY_ITEMS_TAG = "CapabilityItems";
-    private static final int VANILLA_PLAYER_ITEM_HANDLER_SLOTS = 41;
+    private static final String SCOREBOARD_SCORES_TAG = "ScoreboardScores";
+    private static final String SCOREBOARD_TEAM_TAG = "ScoreboardTeam";
+    private static final String CARRIED_STACK_TAG = "CarriedStack";
+    private static final String ROOT_VEHICLE_TAG = "RootVehicle";
+    private static final String PASSENGERS_TAG = "Passengers";
+    private static final Field ATTACHMENTS_FIELD = findAttachmentsField();
 
     private static final Map<UUID, Long> PORTAL_COOLDOWNS = new HashMap<>();
     private static final Map<UUID, PortalWait> PORTAL_WAITS = new HashMap<>();
@@ -90,15 +109,17 @@ public final class CreativeWorldTeleporter {
             return false;
         }
 
+        settleOpenMenuBeforeSnapshot(player);
         CompoundTag session = createSessionSnapshot(player, sourcePortalPos);
+        player.getPersistentData().put(SESSION_TAG, session);
         try {
             prepareForCreativeEntry(player, session);
         } catch (IllegalStateException exception) {
+            player.getPersistentData().remove(SESSION_TAG);
             player.displayClientMessage(Component.literal(exception.getMessage()), false);
             return false;
         }
 
-        player.getPersistentData().put(SESSION_TAG, session);
         prepareCreativeArrival(creativeLevel);
 
         BlockPos spawn = creativeSpawn();
@@ -160,19 +181,11 @@ public final class CreativeWorldTeleporter {
     }
 
     public static void captureForcedCreativeEntry(ServerPlayer player) {
-        if (hasSession(player)) {
+        if (hasSession(player) || isInternalTransfer(player)) {
             return;
         }
 
-        CompoundTag session = createSessionSnapshot(player, player.blockPosition());
-        try {
-            prepareForCreativeEntry(player, session);
-            player.getPersistentData().put(SESSION_TAG, session);
-            player.setGameMode(GameType.CREATIVE);
-            player.displayClientMessage(Component.translatable("message.createworld.forced_session"), false);
-        } catch (IllegalStateException exception) {
-            player.displayClientMessage(Component.literal(exception.getMessage()), false);
-        }
+        rejectUnauthorizedCreativeAccess(player, false);
     }
 
     public static void tick(ServerPlayer player) {
@@ -182,6 +195,9 @@ public final class CreativeWorldTeleporter {
 
     private static void enforceCreativeSession(ServerPlayer player) {
         if (!hasSession(player)) {
+            if (isCreativeWorld(player.level()) && !isInternalTransfer(player)) {
+                rejectUnauthorizedCreativeAccess(player, false);
+            }
             return;
         }
 
@@ -189,8 +205,9 @@ public final class CreativeWorldTeleporter {
             if (player.gameMode.getGameModeForPlayer() != GameType.CREATIVE) {
                 player.setGameMode(GameType.CREATIVE);
             }
+            wipeSnapshotCapabilityItems(player);
         } else if (!isInternalTransfer(player)) {
-            restore(player);
+            exit(player, false);
         }
     }
 
@@ -200,33 +217,26 @@ public final class CreativeWorldTeleporter {
         }
 
         CompoundTag session = getSession(player);
-        CompoundTag snapshot = session.getCompound(SNAPSHOT_TAG);
+        CompoundTag sessionCopy = session.copy();
+        CompoundTag snapshot = sessionCopy.getCompound(SNAPSHOT_TAG).copy();
 
         wipeCreativeCarriedItems(player);
-        player.getInventory().load(snapshot.getList("Inventory", Tag.TAG_COMPOUND));
-        player.getEnderChestInventory().fromTag(snapshot.getList("EnderItems", Tag.TAG_COMPOUND), player.registryAccess());
-        player.getInventory().selected = snapshot.getInt("SelectedItemSlot");
-        restoreCapabilityItems(player, session.getList(CAPABILITY_ITEMS_TAG, Tag.TAG_COMPOUND));
+        clearTransientPersistentStateBeforeSnapshotLoad(player);
+        player.load(snapshot);
+        restoreCapabilityItems(player, sessionCopy.getList(CAPABILITY_ITEMS_TAG, Tag.TAG_COMPOUND));
+        restoreCarriedStack(player, sessionCopy);
 
-        if (snapshot.contains("XpP", Tag.TAG_FLOAT)) {
-            player.experienceProgress = snapshot.getFloat("XpP");
-            player.experienceLevel = snapshot.getInt("XpLevel");
-            player.totalExperience = snapshot.getInt("XpTotal");
-        }
-        if (snapshot.contains("foodLevel", Tag.TAG_INT)) {
-            player.getFoodData().readAdditionalSaveData(snapshot);
-        }
-        if (snapshot.contains("Health", Tag.TAG_FLOAT)) {
-            player.setHealth(Math.min(snapshot.getFloat("Health"), player.getMaxHealth()));
-        }
-        if (snapshot.contains("AbsorptionAmount", Tag.TAG_FLOAT)) {
-            player.setAbsorptionAmount(snapshot.getFloat("AbsorptionAmount"));
-        }
-
-        GameType previousMode = GameType.byName(session.getString("GameMode"), GameType.SURVIVAL);
+        GameType previousMode = GameType.byName(sessionCopy.getString("GameMode"), GameType.SURVIVAL);
         player.setGameMode(previousMode);
+        restoreAbilities(player, snapshot);
+        syncRecipeBook(player);
+        if (sessionCopy.contains(SCOREBOARD_SCORES_TAG, Tag.TAG_LIST)) {
+            restoreScoreboardScores(player, sessionCopy.getList(SCOREBOARD_SCORES_TAG, Tag.TAG_COMPOUND));
+        }
+        restoreScoreboardTeam(player, sessionCopy);
 
         player.getPersistentData().remove(SESSION_TAG);
+        AttachmentSync.syncInitialPlayerAttachments(player);
         player.inventoryMenu.broadcastChanges();
         player.containerMenu.broadcastChanges();
     }
@@ -237,13 +247,64 @@ public final class CreativeWorldTeleporter {
         }
     }
 
+    public static void wipeBeforeCreativePlayerSave(ServerPlayer player) {
+        if (hasSession(player) && isCreativeWorld(player.level())) {
+            wipeCreativeCarriedItems(player);
+        }
+    }
+
+    public static void handleCreativeDeath(ServerPlayer player) {
+        if (!isCreativeWorld(player.level())) {
+            return;
+        }
+
+        wipeCreativeCarriedItems(player);
+        clearCreativeSessionState(player);
+        player.setHealth(player.getMaxHealth());
+
+        BlockPos spawn = creativeSpawn();
+        INTERNAL_TRANSFERS.add(player.getUUID());
+        try {
+            player.teleportTo(player.serverLevel(), spawn.getX() + 0.5D, spawn.getY(), spawn.getZ() + 0.5D, Set.of(), player.getYRot(), player.getXRot());
+        } finally {
+            INTERNAL_TRANSFERS.remove(player.getUUID());
+        }
+    }
+
+    public static void rejectUnauthorizedCreativeAccess(ServerPlayer player, boolean wipeInventory) {
+        if (!isCreativeWorld(player.level())) {
+            return;
+        }
+
+        if (wipeInventory) {
+            wipeCreativeCarriedItems(player);
+        } else {
+            player.closeContainer();
+            player.stopRiding();
+        }
+
+        ServerLevel targetLevel = player.server.overworld();
+        BlockPos spawn = player.adjustSpawnLocation(targetLevel, targetLevel.getSharedSpawnPos());
+        INTERNAL_TRANSFERS.add(player.getUUID());
+        try {
+            player.setGameMode(player.server.getDefaultGameType());
+            player.teleportTo(targetLevel, spawn.getX() + 0.5D, spawn.getY(), spawn.getZ() + 0.5D, Set.of(), targetLevel.getSharedSpawnAngle(), 0.0F);
+        } finally {
+            INTERNAL_TRANSFERS.remove(player.getUUID());
+        }
+
+        player.displayClientMessage(Component.translatable("message.createworld.unauthorized_entry"), false);
+    }
+
     public static void wipeCreativeCarriedItems(ServerPlayer player) {
         player.closeContainer();
+        player.stopRiding();
         player.containerMenu.setCarried(ItemStack.EMPTY);
         player.inventoryMenu.setCarried(ItemStack.EMPTY);
         player.getInventory().clearContent();
         player.getEnderChestInventory().clearContent();
         wipeSnapshotCapabilityItems(player);
+        clearCreativeSessionState(player);
         player.getInventory().setChanged();
         player.getEnderChestInventory().setChanged();
         player.inventoryMenu.broadcastChanges();
@@ -262,6 +323,10 @@ public final class CreativeWorldTeleporter {
         return INTERNAL_TRANSFERS.contains(player.getUUID());
     }
 
+    public static boolean canTravelToCreative(Player player) {
+        return isInternalTransfer(player) || hasSession(player);
+    }
+
     private static void clearStalePortalWait(ServerPlayer player) {
         PortalWait wait = PORTAL_WAITS.get(player.getUUID());
         if (wait != null && player.serverLevel().getGameTime() - wait.lastContactTick > 1) {
@@ -270,10 +335,16 @@ public final class CreativeWorldTeleporter {
     }
 
     private static CompoundTag createSessionSnapshot(ServerPlayer player, BlockPos sourcePortalPos) {
+        disconnectEntityLinks(player);
         CompoundTag session = new CompoundTag();
         CompoundTag snapshot = player.saveWithoutId(new CompoundTag());
+        snapshot.remove(ROOT_VEHICLE_TAG);
+        snapshot.remove(PASSENGERS_TAG);
         session.put(SNAPSHOT_TAG, snapshot);
         session.put(CAPABILITY_ITEMS_TAG, snapshotCapabilityItems(player));
+        session.put(SCOREBOARD_SCORES_TAG, snapshotScoreboardScores(player));
+        saveScoreboardTeam(player, session);
+        saveCarriedStack(player, session);
         session.putString("ReturnDimension", player.level().dimension().location().toString());
         session.putDouble("ReturnX", player.getX());
         session.putDouble("ReturnY", player.getY());
@@ -287,10 +358,116 @@ public final class CreativeWorldTeleporter {
         return session;
     }
 
+    private static void settleOpenMenuBeforeSnapshot(ServerPlayer player) {
+        disconnectEntityLinks(player);
+        if (player.containerMenu != player.inventoryMenu || !player.containerMenu.getCarried().isEmpty()) {
+            player.closeContainer();
+            player.getInventory().setChanged();
+            player.inventoryMenu.broadcastChanges();
+            player.containerMenu.broadcastChanges();
+        }
+    }
+
+    private static void saveCarriedStack(ServerPlayer player, CompoundTag session) {
+        ItemStack carried = player.containerMenu.getCarried();
+        if (carried.isEmpty()) {
+            return;
+        }
+
+        Tag saved = carried.saveOptional(player.registryAccess());
+        if (saved instanceof CompoundTag savedStack) {
+            session.put(CARRIED_STACK_TAG, savedStack);
+        }
+    }
+
+    private static void restoreCarriedStack(ServerPlayer player, CompoundTag session) {
+        ItemStack carried = session.contains(CARRIED_STACK_TAG, Tag.TAG_COMPOUND)
+                ? ItemStack.parseOptional(player.registryAccess(), session.getCompound(CARRIED_STACK_TAG))
+                : ItemStack.EMPTY;
+        player.inventoryMenu.setCarried(carried);
+        if (player.containerMenu != player.inventoryMenu) {
+            player.containerMenu.setCarried(carried.copy());
+        }
+    }
+
+    private static void clearCreativeSessionState(ServerPlayer player) {
+        disconnectEntityLinks(player);
+        player.removeAllEffects();
+        player.setAbsorptionAmount(0.0F);
+        player.clearFire();
+        player.setAirSupply(player.getMaxAirSupply());
+        player.fallDistance = 0.0F;
+        player.setDeltaMovement(0.0D, 0.0D, 0.0D);
+        player.resetCurrentImpulseContext();
+    }
+
+    private static void restoreAbilities(ServerPlayer player, CompoundTag snapshot) {
+        player.getAbilities().loadSaveData(snapshot);
+        var movementSpeed = player.getAttribute(Attributes.MOVEMENT_SPEED);
+        if (movementSpeed != null) {
+            movementSpeed.setBaseValue(player.getAbilities().getWalkingSpeed());
+        }
+        player.onUpdateAbilities();
+    }
+
+    private static void syncRecipeBook(ServerPlayer player) {
+        player.getRecipeBook().sendInitialRecipeBook(player);
+    }
+
+    private static void clearTransientPersistentStateBeforeSnapshotLoad(ServerPlayer player) {
+        clearCompound(player.getPersistentData());
+        player.getTags().clear();
+        player.setCustomName(null);
+        player.setCustomNameVisible(false);
+        clearCompound(player.getShoulderEntityLeft());
+        clearCompound(player.getShoulderEntityRight());
+        player.setLastDeathLocation(Optional.empty());
+        player.resetCurrentImpulseContext();
+        clearDataAttachments(player);
+    }
+
+    private static void disconnectEntityLinks(ServerPlayer player) {
+        player.ejectPassengers();
+        player.stopRiding();
+    }
+
+    private static void clearCompound(CompoundTag tag) {
+        for (String key : Set.copyOf(tag.getAllKeys())) {
+            tag.remove(key);
+        }
+    }
+
+    private static void clearDataAttachments(ServerPlayer player) {
+        if (ATTACHMENTS_FIELD == null) {
+            return;
+        }
+
+        try {
+            Object attachments = ATTACHMENTS_FIELD.get(player);
+            if (attachments instanceof Map<?, ?> map) {
+                map.clear();
+            } else if (attachments != null) {
+                ATTACHMENTS_FIELD.set(player, null);
+            }
+        } catch (IllegalAccessException | RuntimeException exception) {
+            CreateWorld.LOGGER.warn("Could not clear creative-session data attachments for {}", player.getGameProfile().getName(), exception);
+        }
+    }
+
+    private static Field findAttachmentsField() {
+        try {
+            Field field = AttachmentHolder.class.getDeclaredField("attachments");
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException | RuntimeException exception) {
+            CreateWorld.LOGGER.warn("Could not access NeoForge attachment storage; creative-session attachment cleanup is limited", exception);
+            return null;
+        }
+    }
+
     private static void prepareForCreativeEntry(ServerPlayer player, CompoundTag session) {
-        ListTag capabilityItems = session.getList(CAPABILITY_ITEMS_TAG, Tag.TAG_COMPOUND);
-        if (capabilityItems.isEmpty() && hasNonVanillaCapabilityItems(player)) {
-            throw new IllegalStateException("CreateWorld cannot safely clear a modded player inventory exposed by another mod.");
+        if (hasUnsupportedNonVanillaItemHandler(player)) {
+            throw new IllegalStateException("CreateWorld cannot safely clear a read-only modded player inventory exposed by another mod.");
         }
         player.closeContainer();
         player.containerMenu.setCarried(ItemStack.EMPTY);
@@ -298,6 +475,7 @@ public final class CreativeWorldTeleporter {
         player.getInventory().clearContent();
         player.getEnderChestInventory().clearContent();
         wipeSnapshotCapabilityItems(player);
+        clearCreativeSessionState(player);
         player.getInventory().setChanged();
         player.getEnderChestInventory().setChanged();
         player.inventoryMenu.broadcastChanges();
@@ -307,7 +485,7 @@ public final class CreativeWorldTeleporter {
     private static ListTag snapshotCapabilityItems(ServerPlayer player) {
         ListTag list = new ListTag();
         IItemHandler handler = player.getCapability(Capabilities.ItemHandler.ENTITY);
-        if (!(handler instanceof IItemHandlerModifiable modifiable) || !shouldSnapshotCapability(handler)) {
+        if (!(handler instanceof IItemHandlerModifiable) || !shouldSnapshotCapability(player, handler)) {
             return list;
         }
 
@@ -322,9 +500,79 @@ public final class CreativeWorldTeleporter {
                     list.add(slotTag);
                 }
             }
-            modifiable.setStackInSlot(slot, ItemStack.EMPTY);
         }
         return list;
+    }
+
+    private static ListTag snapshotScoreboardScores(ServerPlayer player) {
+        ListTag list = new ListTag();
+        Scoreboard scoreboard = player.getScoreboard();
+        ScoreHolder holder = ScoreHolder.forNameOnly(player.getScoreboardName());
+
+        for (Objective objective : scoreboard.getObjectives()) {
+            ReadOnlyScoreInfo score = scoreboard.getPlayerScoreInfo(holder, objective);
+            if (score != null) {
+                CompoundTag tag = new CompoundTag();
+                tag.putString("Objective", objective.getName());
+                tag.putInt("Value", score.value());
+                tag.putBoolean("Locked", score.isLocked());
+                list.add(tag);
+            }
+        }
+
+        return list;
+    }
+
+    private static void restoreScoreboardScores(ServerPlayer player, ListTag savedScores) {
+        Scoreboard scoreboard = player.getScoreboard();
+        ScoreHolder holder = ScoreHolder.forNameOnly(player.getScoreboardName());
+        Set<String> restoredObjectives = new HashSet<>();
+
+        for (int index = 0; index < savedScores.size(); index++) {
+            CompoundTag tag = savedScores.getCompound(index);
+            Objective objective = scoreboard.getObjective(tag.getString("Objective"));
+            if (objective == null) {
+                continue;
+            }
+
+            ScoreAccess score = scoreboard.getOrCreatePlayerScore(holder, objective, true);
+            score.set(tag.getInt("Value"));
+            if (tag.getBoolean("Locked")) {
+                score.lock();
+            } else {
+                score.unlock();
+            }
+            restoredObjectives.add(objective.getName());
+        }
+
+        for (Objective objective : scoreboard.getObjectives()) {
+            if (!restoredObjectives.contains(objective.getName())
+                    && scoreboard.getPlayerScoreInfo(holder, objective) != null) {
+                scoreboard.resetSinglePlayerScore(holder, objective);
+            }
+        }
+    }
+
+    private static void saveScoreboardTeam(ServerPlayer player, CompoundTag session) {
+        var team = player.getScoreboard().getPlayersTeam(player.getScoreboardName());
+        if (team != null) {
+            session.putString(SCOREBOARD_TEAM_TAG, team.getName());
+        }
+    }
+
+    private static void restoreScoreboardTeam(ServerPlayer player, CompoundTag session) {
+        Scoreboard scoreboard = player.getScoreboard();
+        String playerName = player.getScoreboardName();
+        scoreboard.removePlayerFromTeam(playerName);
+
+        if (!session.contains(SCOREBOARD_TEAM_TAG, Tag.TAG_STRING)) {
+            return;
+        }
+
+        var savedTeam = scoreboard.getPlayerTeam(session.getString(SCOREBOARD_TEAM_TAG));
+        if (savedTeam != null) {
+            scoreboard.addPlayerToTeam(playerName, savedTeam);
+        }
     }
 
     private static void restoreCapabilityItems(ServerPlayer player, ListTag slots) {
@@ -333,7 +581,7 @@ public final class CreativeWorldTeleporter {
         }
 
         IItemHandler handler = player.getCapability(Capabilities.ItemHandler.ENTITY);
-        if (!(handler instanceof IItemHandlerModifiable modifiable) || !shouldSnapshotCapability(handler)) {
+        if (!(handler instanceof IItemHandlerModifiable modifiable) || !shouldSnapshotCapability(player, handler)) {
             CreateWorld.LOGGER.warn("Could not restore {} modded capability item slots for {}", slots.size(), player.getGameProfile().getName());
             return;
         }
@@ -350,7 +598,7 @@ public final class CreativeWorldTeleporter {
 
     private static void wipeSnapshotCapabilityItems(ServerPlayer player) {
         IItemHandler handler = player.getCapability(Capabilities.ItemHandler.ENTITY);
-        if (!(handler instanceof IItemHandlerModifiable modifiable) || !shouldSnapshotCapability(handler)) {
+        if (!(handler instanceof IItemHandlerModifiable modifiable) || !shouldSnapshotCapability(player, handler)) {
             return;
         }
 
@@ -359,22 +607,99 @@ public final class CreativeWorldTeleporter {
         }
     }
 
-    private static boolean hasNonVanillaCapabilityItems(ServerPlayer player) {
+    private static boolean hasUnsupportedNonVanillaItemHandler(ServerPlayer player) {
         IItemHandler handler = player.getCapability(Capabilities.ItemHandler.ENTITY);
-        if (handler == null || handler instanceof IItemHandlerModifiable || !shouldSnapshotCapability(handler)) {
+        if (handler != null
+                && !(handler instanceof IItemHandlerModifiable)
+                && shouldSnapshotCapability(player, handler)
+                && hasNonVanillaItems(player, handler)) {
+            return true;
+        }
+
+        return !hasSupportedNonVanillaCombinedItemHandler(player) && hasNonVanillaAutomationItemHandler(player);
+    }
+
+    private static boolean hasSupportedNonVanillaCombinedItemHandler(ServerPlayer player) {
+        IItemHandler handler = player.getCapability(Capabilities.ItemHandler.ENTITY);
+        return handler instanceof IItemHandlerModifiable && shouldSnapshotCapability(player, handler);
+    }
+
+    private static boolean hasNonVanillaAutomationItemHandler(ServerPlayer player) {
+        IItemHandler handler = player.getCapability(Capabilities.ItemHandler.ENTITY_AUTOMATION, null);
+        if (handler != null && shouldSnapshotCapability(player, handler) && hasNonVanillaItems(player, handler)) {
+            return true;
+        }
+
+        for (Direction direction : Direction.values()) {
+            handler = player.getCapability(Capabilities.ItemHandler.ENTITY_AUTOMATION, direction);
+            if (handler != null && shouldSnapshotCapability(player, handler) && hasNonVanillaItems(player, handler)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean shouldSnapshotCapability(ServerPlayer player, IItemHandler handler) {
+        return !isVanillaInventoryMirror(player, handler);
+    }
+
+    private static boolean hasNonVanillaItems(ServerPlayer player, IItemHandler handler) {
+        List<ItemStack> remainingVanillaStacks = new ArrayList<>();
+        var inventory = player.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isEmpty()) {
+                remainingVanillaStacks.add(stack.copy());
+            }
+        }
+
+        for (int slot = 0; slot < handler.getSlots(); slot++) {
+            ItemStack stack = handler.getStackInSlot(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            if (!consumeMatchingVanillaStack(remainingVanillaStacks, stack)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean consumeMatchingVanillaStack(List<ItemStack> vanillaStacks, ItemStack stack) {
+        for (int index = 0; index < vanillaStacks.size(); index++) {
+            ItemStack vanillaStack = vanillaStacks.get(index);
+            if (ItemStack.matches(vanillaStack, stack) && vanillaStack.getCount() >= stack.getCount()) {
+                vanillaStack.shrink(stack.getCount());
+                if (vanillaStack.isEmpty()) {
+                    vanillaStacks.remove(index);
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean isVanillaInventoryMirror(ServerPlayer player, IItemHandler handler) {
+        if (handler instanceof PlayerInvWrapper) {
+            return true;
+        }
+
+        var inventory = player.getInventory();
+        if (handler.getSlots() != inventory.getContainerSize()) {
             return false;
         }
 
         for (int slot = 0; slot < handler.getSlots(); slot++) {
-            if (!handler.getStackInSlot(slot).isEmpty()) {
-                return true;
+            if (!ItemStack.matches(handler.getStackInSlot(slot), inventory.getItem(slot))) {
+                return false;
             }
         }
-        return false;
-    }
 
-    private static boolean shouldSnapshotCapability(IItemHandler handler) {
-        return handler.getSlots() != VANILLA_PLAYER_ITEM_HANDLER_SLOTS;
+        return true;
     }
 
     private static CompoundTag getSession(Player player) {
@@ -399,21 +724,22 @@ public final class CreativeWorldTeleporter {
             return;
         }
 
-        for (int x = -2; x <= 2; x++) {
-            for (int z = -2; z <= 2; z++) {
+        for (int x = -3; x <= 3; x++) {
+            for (int z = -2; z <= 7; z++) {
                 level.setBlock(spawn.offset(x, -1, z), net.minecraft.world.level.block.Blocks.SMOOTH_STONE.defaultBlockState(), net.minecraft.world.level.block.Block.UPDATE_ALL);
                 level.setBlock(spawn.offset(x, 0, z), net.minecraft.world.level.block.Blocks.AIR.defaultBlockState(), net.minecraft.world.level.block.Block.UPDATE_ALL);
                 level.setBlock(spawn.offset(x, 1, z), net.minecraft.world.level.block.Blocks.AIR.defaultBlockState(), net.minecraft.world.level.block.Block.UPDATE_ALL);
+                level.setBlock(spawn.offset(x, 2, z), net.minecraft.world.level.block.Blocks.AIR.defaultBlockState(), net.minecraft.world.level.block.Block.UPDATE_ALL);
             }
         }
 
-        CreativePortalShape.buildReturnPortal(level, returnPortal, net.minecraft.core.Direction.Axis.X);
+        CreativePortalShape.buildReturnPortal(level, returnPortal);
     }
 
-    private static boolean hasReturnPortal(ServerLevel level, BlockPos lowerLeftInside) {
-        for (int x = 0; x < 2; x++) {
-            for (int y = 0; y < 3; y++) {
-                if (level.getBlockState(lowerLeftInside.offset(x, y, 0)).is(CreateWorld.CREATIVE_PORTAL.get())) {
+    private static boolean hasReturnPortal(ServerLevel level, BlockPos northWestInside) {
+        for (int x = 0; x < 3; x++) {
+            for (int z = 0; z < 3; z++) {
+                if (level.getBlockState(northWestInside.offset(x, 0, z)).is(CreateWorld.CREATIVE_PORTAL.get())) {
                     return true;
                 }
             }

@@ -23,7 +23,8 @@ public final class CreativePortalActivatorItem extends Item {
             return InteractionResult.SUCCESS;
         }
 
-        if (CreativePortalShape.tryCreate((ServerLevel) level, inside)) {
+        if (CreativePortalShape.tryCreate((ServerLevel) level, clicked)
+                || CreativePortalShape.tryCreate((ServerLevel) level, inside)) {
             return InteractionResult.CONSUME;
         }
 

@@ -10,39 +10,34 @@ import net.minecraft.world.level.block.state.BlockState;
 import java.util.Optional;
 
 public final class CreativePortalShape {
-    private static final int INNER_WIDTH = 2;
-    private static final int INNER_HEIGHT = 3;
+    private static final int INNER_SIZE = 3;
 
     private final ServerLevel level;
-    private final BlockPos lowerLeftInside;
-    private final Direction right;
-    private final Direction.Axis axis;
+    private final BlockPos northWestInside;
 
-    private CreativePortalShape(ServerLevel level, BlockPos lowerLeftInside, Direction right, Direction.Axis axis) {
+    private CreativePortalShape(ServerLevel level, BlockPos northWestInside) {
         this.level = level;
-        this.lowerLeftInside = lowerLeftInside;
-        this.right = right;
-        this.axis = axis;
+        this.northWestInside = northWestInside;
     }
 
-    public static boolean tryCreate(ServerLevel level, BlockPos inside) {
-        Optional<CreativePortalShape> shape = find(level, inside);
+    public static boolean tryCreate(ServerLevel level, BlockPos candidate) {
+        Optional<CreativePortalShape> shape = find(level, candidate);
         shape.ifPresent(CreativePortalShape::placePortal);
         return shape.isPresent();
     }
 
-    public static Optional<CreativePortalShape> find(ServerLevel level, BlockPos inside) {
-        return find(level, inside, Direction.EAST, Direction.Axis.X)
-                .or(() -> find(level, inside, Direction.SOUTH, Direction.Axis.Z));
-    }
-
-    private static Optional<CreativePortalShape> find(ServerLevel level, BlockPos inside, Direction right, Direction.Axis axis) {
-        for (int down = 0; down < INNER_HEIGHT; down++) {
-            for (int left = 0; left < INNER_WIDTH; left++) {
-                BlockPos lowerLeft = inside.relative(right, -left).below(down);
-                CreativePortalShape shape = new CreativePortalShape(level, lowerLeft, right, axis);
-                if (shape.isValid()) {
-                    return Optional.of(shape);
+    public static Optional<CreativePortalShape> find(ServerLevel level, BlockPos candidate) {
+        for (int yOffset = -1; yOffset <= 1; yOffset++) {
+            for (int relativeX = -1; relativeX <= INNER_SIZE; relativeX++) {
+                for (int relativeZ = -1; relativeZ <= INNER_SIZE; relativeZ++) {
+                    BlockPos northWestInside = new BlockPos(
+                            candidate.getX() - relativeX,
+                            candidate.getY() + yOffset,
+                            candidate.getZ() - relativeZ);
+                    CreativePortalShape shape = new CreativePortalShape(level, northWestInside);
+                    if (shape.isValid()) {
+                        return Optional.of(shape);
+                    }
                 }
             }
         }
@@ -50,10 +45,10 @@ public final class CreativePortalShape {
     }
 
     private boolean isValid() {
-        for (int x = -1; x <= INNER_WIDTH; x++) {
-            for (int y = -1; y <= INNER_HEIGHT; y++) {
-                BlockPos pos = lowerLeftInside.relative(right, x).above(y);
-                boolean frame = x == -1 || x == INNER_WIDTH || y == -1 || y == INNER_HEIGHT;
+        for (int x = -1; x <= INNER_SIZE; x++) {
+            for (int z = -1; z <= INNER_SIZE; z++) {
+                BlockPos pos = northWestInside.offset(x, 0, z);
+                boolean frame = x == -1 || x == INNER_SIZE || z == -1 || z == INNER_SIZE;
                 BlockState state = level.getBlockState(pos);
 
                 if (frame) {
@@ -73,21 +68,21 @@ public final class CreativePortalShape {
     }
 
     private void placePortal() {
-        BlockState portal = CreateWorld.CREATIVE_PORTAL.get().defaultBlockState().setValue(CreativePortalBlock.AXIS, axis);
-        for (int x = 0; x < INNER_WIDTH; x++) {
-            for (int y = 0; y < INNER_HEIGHT; y++) {
-                level.setBlock(lowerLeftInside.relative(right, x).above(y), portal, Block.UPDATE_ALL);
+        BlockState portal = CreateWorld.CREATIVE_PORTAL.get()
+                .defaultBlockState()
+                .setValue(CreativePortalBlock.AXIS, Direction.Axis.X);
+        for (int x = 0; x < INNER_SIZE; x++) {
+            for (int z = 0; z < INNER_SIZE; z++) {
+                level.setBlock(northWestInside.offset(x, 0, z), portal, Block.UPDATE_ALL);
             }
         }
     }
 
-    public static void buildReturnPortal(ServerLevel level, BlockPos lowerLeftInside, Direction.Axis axis) {
-        Direction right = axis == Direction.Axis.X ? Direction.EAST : Direction.SOUTH;
-
-        for (int x = -1; x <= INNER_WIDTH; x++) {
-            for (int y = -1; y <= INNER_HEIGHT; y++) {
-                BlockPos pos = lowerLeftInside.relative(right, x).above(y);
-                boolean frame = x == -1 || x == INNER_WIDTH || y == -1 || y == INNER_HEIGHT;
+    public static void buildReturnPortal(ServerLevel level, BlockPos northWestInside) {
+        for (int x = -1; x <= INNER_SIZE; x++) {
+            for (int z = -1; z <= INNER_SIZE; z++) {
+                BlockPos pos = northWestInside.offset(x, 0, z);
+                boolean frame = x == -1 || x == INNER_SIZE || z == -1 || z == INNER_SIZE;
                 if (frame) {
                     level.setBlock(pos, CreateWorld.CREATIVE_PORTAL_FRAME.get().defaultBlockState(), Block.UPDATE_ALL);
                 } else {
@@ -96,6 +91,6 @@ public final class CreativePortalShape {
             }
         }
 
-        new CreativePortalShape(level, lowerLeftInside, right, axis).placePortal();
+        new CreativePortalShape(level, northWestInside).placePortal();
     }
 }

@@ -1,0 +1,16 @@
+{
+  "replace": false,
+  "values": [
+    "minecraft:armor_stand",
+    "minecraft:chest_boat",
+    "minecraft:chest_minecart",
+    "minecraft:command_block_minecart",
+    "minecraft:glow_item_frame",
+    "minecraft:hopper_minecart",
+    "minecraft:item_frame",
+    "minecraft:donkey",
+    "minecraft:mule",
+    "minecraft:llama",
+    "minecraft:trader_llama"
+  ]
+}
